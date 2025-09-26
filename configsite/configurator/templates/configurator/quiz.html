@@ -1,0 +1,411 @@
+{% extends "configurator/base.html" %}
+{% block title %}Spectralab — {{ group.name }} · Quiz{% endblock %}
+{% block header_title %}{{ group.name }} — Quiz{% endblock %}
+
+{% block content %}
+<section class="section">
+
+  <!-- Progress bar -->
+  <div class="progress"><div class="progress__bar" id="quizProgressBar"></div></div>
+
+<div class="question-tags-nav" id="tagNav">
+  {% for tag in question_tags %}
+    <button type="button"
+            class="tag-btn"
+            data-tag-index="{{ forloop.counter0 }}"
+            style="display:none;">
+      <span>{{ tag }}</span>
+    </button>
+  {% endfor %}
+</div>
+
+
+  <!-- Quiz Form -->
+  <form id="quizForm" method="post" novalidate autocomplete="off">
+    {% csrf_token %}
+    <input type="hidden" name="step" value="answers">
+
+    <style>
+      .qpanel[hidden]{ display:none !important; }
+    </style>
+
+    <div id="quizPanels">
+      {% for field in form %}
+        {% with is_multi=field.field.widget.attrs.data_multi %}
+        {% with is_required=field.field.required %}
+        {% with data_visible=field.field.widget.attrs.data_visible|default:'1' %}
+        {% with data_depends_on=field.field.widget.attrs.data_depends_on|default:'' %}
+        {% with data_triggers=field.field.widget.attrs.data_trigger_choices|default:'' %}
+        <fieldset class="qpanel"
+                  id="wrap_{{ field.name }}"
+                  data-panel-index="{{ forloop.counter0 }}"
+                  data-multi="{{ is_multi }}"
+                  data-required="{{ is_required|yesno:'1,0' }}"
+                  data-depends-on="{{ data_depends_on }}"
+                  data-trigger-choices="{{ data_triggers }}"
+                  data-visible="{{ data_visible }}"
+                  {% if data_visible == '0' %}hidden{% endif %}
+                  aria-hidden="true">
+          <legend class="h2" style="margin-bottom:8px;">
+            {{ field.label }}
+            {% if is_multi == '1' %}
+              <span class="badge badge--multi">Multi-select</span>
+            {% else %}
+              <span class="badge badge--single">Single choice</span>
+            {% endif %}
+          </legend>
+
+          <p class="qhelp">{{ is_multi|yesno:"Select all that apply.,Select one option." }}</p>
+
+          {% with first_choice=field.field.queryset|first %}
+            {% if first_choice and first_choice.question.image %}
+              <div class="question-media-wrap">
+                <img class="question-media" src="{{ first_choice.question.image.url }}" alt="{{ field.label }}">
+              </div>
+            {% endif %}
+          {% endwith %}
+
+          <div class="choice">
+            {% for opt in field.field.queryset %}
+              {% with input_id=field.name|stringformat:"s"|add:"_"|add:opt.id|stringformat:"s" %}
+              <label class="choice__item"
+                     data-type="{% if is_multi == '1' %}checkbox{% else %}radio{% endif %}"
+                     for="{{ input_id }}">
+                {% if is_multi == '1' %}
+                  <input id="{{ input_id }}" type="checkbox" name="{{ field.name }}" value="{{ opt.id }}"
+                         {% if field.value and opt.id in field.value %}checked{% endif %} />
+                {% else %}
+                  <input id="{{ input_id }}" type="radio" name="{{ field.name }}" value="{{ opt.id }}"
+                         {% if field.value == opt.id %}checked{% endif %} />
+                {% endif %}
+                <span class="choice__tick"><span class="choice__mark"></span></span>
+                <span class="choice__body">
+                  {% if opt.image %}
+                    <img src="{{ opt.image.url }}" alt="{{ opt.text }}" class="choice-media">
+                  {% endif %}
+                  <span class="choice__text">{{ opt.text }}</span>
+                </span>
+              </label>
+              {% endwith %}
+            {% endfor %}
+          </div>
+
+          {% if field.errors %}
+            <div class="field-error">{{ field.errors }}</div>
+          {% endif %}
+        </fieldset>
+        {% endwith %}
+        {% endwith %}
+        {% endwith %}
+        {% endwith %}
+        {% endwith %}
+      {% endfor %}
+    </div>
+
+    <!-- Navigation Controls -->
+    <div class="quiz-nav" style="margin-top:14px; display:flex; gap:10px; align-items:center;">
+      <button type="button" id="btnPrev" class="btn btn--ghost" disabled>← Previous</button>
+      <button type="button" id="btnNext" class="btn">Next →</button>
+      <button type="submit" id="btnSubmit" class="btn" style="display:none;">Continue</button>
+      <span id="quizStepBadge" class="p" style="margin-left:auto;"></span>
+    </div>
+  </form>
+</section>
+
+<!-- Script -->
+<script>
+  // Globals bound below so tag buttons can call jumpToPanel
+  let showPanel;
+  let getVisiblePanels;
+
+  (function() {
+    const form = document.getElementById('quizForm');
+    const allPanels = Array.from(document.querySelectorAll('.qpanel'));
+    const prevBtn = document.getElementById('btnPrev');
+    const nextBtn = document.getElementById('btnNext');
+    const submitBtn = document.getElementById('btnSubmit');
+    const stepBadge = document.getElementById('quizStepBadge');
+    const progressBar = document.getElementById('quizProgressBar');
+    const tagButtons = Array.from(document.querySelectorAll('.tag-btn'));
+
+    // After: const tagButtons = Array.from(document.querySelectorAll('.tag-btn'));
+tagButtons.forEach(btn => {
+  btn.addEventListener('click', () => {
+    const originalIndex = parseInt(btn.dataset.tagIndex, 10);
+    if (!Number.isNaN(originalIndex)) {
+      window.jumpToPanel(originalIndex);
+    }
+  });
+});
+
+
+
+    // REVEAL TAG for current panel (progressive/breadcrumb style)
+  function revealTag(originalIndex) {
+  const btn = document.querySelector(`.tag-btn[data-tag-index="${originalIndex}"]`);
+  if (btn) btn.style.display = "inline-block";
+  }
+
+
+    if (!allPanels.length) return;
+
+    // --- Visibility / dependency helpers -----------------------------------
+    function selectedChoiceIdsOf(panelEl){
+      const inputs = document.querySelectorAll(`#${panelEl.id} input[type=radio], #${panelEl.id} input[type=checkbox]`);
+      const ids = new Set();
+      inputs.forEach(i => { if(i.checked) ids.add(parseInt(i.value,10)); });
+      return ids;
+    }
+
+    function computeShouldShow(panelEl){
+      const dependsOn = panelEl.dataset.dependsOn;
+      const triggersStr = panelEl.dataset.triggerChoices || '';
+      if (!dependsOn) return true;
+      const parent = document.getElementById(dependsOn);
+      if (!parent || parent.hasAttribute('hidden')) return false;
+      const selected = selectedChoiceIdsOf(parent);
+      const triggers = triggersStr.split(',').filter(Boolean).map(s => parseInt(s,10));
+      // If triggers are defined -> need intersection. If not, any selection of parent reveals child.
+      return (triggers.length > 0) ? triggers.some(id => selected.has(id)) : (selected.size > 0);
+    }
+
+    function applyVisibility(){
+      // Resolve repeatedly until stable (handles multi-level dependencies)
+      let changed = true, guard = 0;
+      while(changed && guard < 10){
+        changed = false; guard++;
+        allPanels.forEach(p => {
+          const shouldShow = computeShouldShow(p);
+          const isHidden = p.hasAttribute('hidden');
+          if (shouldShow && isHidden){
+            p.removeAttribute('hidden');
+            p.dataset.visible = '1';
+            // re-enable inputs
+            p.querySelectorAll('input,select,textarea').forEach(el => {
+              el.disabled = false;
+            });
+            changed = true;
+          } else if (!shouldShow && !isHidden){
+            p.setAttribute('hidden', '');
+            p.dataset.visible = '0';
+            // disable + clear inputs so they don't submit/validate
+            p.querySelectorAll('input[type=radio], input[type=checkbox]').forEach(el => {
+              el.checked = false;
+              el.disabled = true;
+            });
+            changed = true;
+          }
+        });
+      }
+    }
+
+    getVisiblePanels = function(){ return allPanels.filter(p => !p.hasAttribute('hidden')); };
+
+    // --- Navigation & progress (visible-only) --------------------------------
+    let vidx = 0; // index *within* visible panels
+
+    function currentPanels(){ return getVisiblePanels(); }
+    function currentPanel(){ return currentPanels()[vidx]; }
+
+    function currentIsMulti(){ return currentPanel().dataset.multi === '1'; }
+    function currentIsRequired(){ return currentPanel().dataset.required === '1'; }
+
+    function answered(panelEl = currentPanel()){
+      const inputs = panelEl.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+      return Array.from(inputs).some(el => el.checked);
+    }
+
+    function selectionCount(panelEl = currentPanel()){
+      return panelEl.querySelectorAll('input:checked').length;
+    }
+
+    function computeProgressPct(){
+      const vis = currentPanels();
+      if(!vis.length) return 0;
+      const c = vis.filter(p => answered(p)).length;
+      return Math.round((c / vis.length) * 100);
+    }
+
+    function updateProgress(){
+      const pct = computeProgressPct();
+      progressBar.style.width = pct + '%';
+      document.documentElement.style.setProperty('--quiz-progress', pct + '%');
+    }
+
+    function highlightActiveTag(){
+      // Map visible panel positions back to tag buttons by original panel index
+      const vis = currentPanels();
+      const activePanel = currentPanel();
+      const activeOriginalIndex = parseInt(activePanel.dataset.panelIndex, 10);
+      tagButtons.forEach((btn, i) => {
+        btn.classList.toggle('tag-btn--active', i === activeOriginalIndex);
+      });
+    }
+
+    function updateNav(){
+      const vis = currentPanels();
+      const onLast = (vidx === vis.length - 1);
+      prevBtn.disabled = (vidx === 0);
+
+      if (currentIsMulti()) {
+        nextBtn.style.display = onLast ? 'none' : '';
+        submitBtn.style.display = onLast ? '' : 'none';
+        const count = selectionCount();
+        nextBtn.textContent = onLast ? 'Next →' : (count > 0 ? `Next → (${count} selected)` : 'Next →');
+        stepBadge.textContent = `Step ${vidx + 1} of ${vis.length} • Multi-select`;
+      } else {
+        nextBtn.style.display = 'none';
+        submitBtn.style.display = onLast ? '' : 'none';
+        stepBadge.textContent = `Step ${vidx + 1} of ${vis.length} • Single choice`;
+      }
+    }
+
+    function focusPanel(panelEl){
+      const legend = panelEl.querySelector('legend');
+      if (legend) {
+        legend.setAttribute('tabindex', '-1');
+        legend.focus({ preventScroll: true });
+        setTimeout(() => legend.removeAttribute('tabindex'), 0);
+      }
+    }
+
+    showPanel = function(newVisibleIndex){
+      const vis = currentPanels();
+      if (!vis.length) return;
+      if (newVisibleIndex < 0) newVisibleIndex = 0;
+      if (newVisibleIndex > vis.length - 1) newVisibleIndex = vis.length - 1;
+
+      const tgt = vis[newVisibleIndex];
+
+      revealTag(parseInt(tgt.dataset.panelIndex, 10));
+      // aria-hidden only among *visible* panels
+      vis.forEach(p => p.setAttribute('aria-hidden', p === tgt ? 'false' : 'true'));
+
+      vidx = newVisibleIndex;
+      updateNav();
+      updateProgress();
+      highlightActiveTag();
+      focusPanel(tgt);
+    }
+
+    function nudgeRequired(panelEl = currentPanel()){
+      panelEl.style.outline = '2px solid rgba(211,51,51,.25)';
+      setTimeout(() => panelEl.style.outline = 'none', 400);
+    }
+
+    function goNext(){
+      const vis = currentPanels();
+      const onLast = (vidx === vis.length - 1);
+      if (onLast) return;
+      if (currentIsRequired() && !answered()) {
+        nudgeRequired();
+        return;
+      }
+      showPanel(vidx + 1);
+    }
+
+    function goPrev(){
+      if (vidx > 0) showPanel(vidx - 1);
+    }
+
+    // --- Wire events ----------------------------------------------------------
+    // Click-to-select behavior on the whole choice row
+    allPanels.forEach((panel) => {
+      panel.addEventListener('click', (e) => {
+        const label = e.target.closest('label.choice__item');
+        if (!label || !panel.contains(label) || panel.hasAttribute('hidden')) return;
+
+        const input = label.querySelector('input[type="radio"], input[type="checkbox"]');
+        if (!input) return;
+
+        e.preventDefault();
+        input.checked = input.type === 'radio' ? true : !input.checked;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+
+        if (input.type === 'radio') {
+          setTimeout(() => {
+            // Selections may change visibility; recompute before navigating
+            applyVisibility();
+            // Jump to next only if this panel is still the current visible one
+            const vis = currentPanels();
+            const nowIdx = vis.indexOf(panel);
+            if (nowIdx !== -1 && nowIdx === vidx) goNext();
+          }, 120);
+        }
+
+
+      });
+
+      panel.addEventListener('change', () => {
+        // Any change can affect visibility of dependents
+        applyVisibility();
+        updateProgress();
+        // If current panel became hidden due to change, move to nearest visible
+        const vis = currentPanels();
+        if (vis.length && (vidx >= vis.length || vis[vidx].hasAttribute('hidden'))) {
+          // Find next visible panel by original order after the changed one
+          const nextIdx = vis.findIndex(p => !p.hasAttribute('hidden'));
+          showPanel(nextIdx === -1 ? 0 : Math.max(0, Math.min(vidx, vis.length - 1)));
+          return;
+        }
+        // For multi, live-update next button label
+        if (currentIsMulti()) updateNav();
+      });
+
+      panel.addEventListener('keydown', (e) => {
+        if (panel.hasAttribute('hidden')) return;
+        if (e.key === 'Enter' && panel.dataset.multi === '1') {
+          e.preventDefault(); goNext();
+        }
+        if (e.key === 'ArrowLeft') { e.preventDefault(); goPrev(); }
+        if (e.key === 'ArrowRight') { e.preventDefault(); goNext(); }
+      });
+    });
+
+    prevBtn.addEventListener('click', goPrev);
+    nextBtn.addEventListener('click', goNext);
+
+    // Prevent jumping forward via tag if current required is unanswered (backward always allowed)
+    window.jumpToPanel = function(originalIndex) {
+      // Map original index to current visible index
+      const targetPanel = allPanels.find(p => parseInt(p.dataset.panelIndex,10) === originalIndex);
+      if (!targetPanel || targetPanel.hasAttribute('hidden')) return;
+
+      const vis = currentPanels();
+      const targetVisibleIdx = vis.indexOf(targetPanel);
+      if (targetVisibleIdx === -1) return;
+
+      const isForward = targetVisibleIdx > vidx;
+      if (isForward) {
+        const isRequired = currentIsRequired();
+        const hasAnswer = answered();
+        if (isRequired && !hasAnswer) {
+          nudgeRequired();
+          return;
+        }
+      }
+      showPanel(targetVisibleIdx);
+    };
+
+    // Block submit if any required *visible* question is unanswered. Jump to first missing one.
+    form.addEventListener('submit', (e) => {
+      applyVisibility();
+      const vis = currentPanels();
+      const firstUnanswered = vis.findIndex((p) => {
+        if (p.dataset.required !== '1') return false;
+        return !Array.from(p.querySelectorAll('input[type="radio"], input[type="checkbox"]')).some(el => el.checked);
+      });
+      if (firstUnanswered !== -1) {
+        e.preventDefault();
+        showPanel(firstUnanswered);
+        nudgeRequired(vis[firstUnanswered]);
+      }
+    });
+
+    // --- Initial render -------------------------------------------------------
+    applyVisibility();
+    showPanel(0);
+  })();
+</script>
+
+{% endblock %}

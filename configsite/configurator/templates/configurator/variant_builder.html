@@ -1,0 +1,278 @@
+{% extends "configurator/base.html" %}
+{% load static %}
+{% block title %}{{ group.name }} — Build your {{ item.name }}{% endblock %}
+{% block header_title %}{{ group.name }} — Build your {{ item.name }}{% endblock %}
+
+{% block extra_head %}
+  <link rel="stylesheet" href="{% static 'configurator.css' %}">
+{% endblock %}
+
+{% block content %}
+<section class="section">
+
+  <div class="result-header">
+    <h1 class="h1">Make your own {{ item.name }}</h1>
+    <div class="result-header__actions">
+      <a class="btn btn--ghost" href="{% url 'configurator:group_list' %}">Other groups</a>
+    </div>
+  </div>
+
+  {# -------------------- QUIZ PHASE -------------------- #}
+  {# Tri-state: matches is None -> show quiz #}
+  {% if matches is None %}
+  <div id="quizShell">
+    <div class="progress"><div class="progress__bar" id="quizProgressBar"></div></div>
+
+    {% if question_tags %}
+      <div class="question-tags-nav">
+        {% for tag in question_tags %}
+          <button type="button" class="tag-btn" onclick="jumpToPanel({{ forloop.counter0 }})">
+            <span>{{ tag }}</span>
+          </button>
+        {% endfor %}
+      </div>
+    {% endif %}
+
+    <form id="quizForm" method="post" novalidate autocomplete="off">
+      {% csrf_token %}
+      <input type="hidden" name="step" value="answers">
+
+      <div id="quizPanels">
+        {% for field in form %}
+          {% with is_multi=field.field.widget.attrs.data_multi|default:"1" %}
+          <fieldset class="qpanel"
+                    data-panel-index="{{ forloop.counter0 }}"
+                    data-multi="{{ is_multi }}"
+                    data-required="{{ field.field.required|yesno:'1,0' }}"
+                    aria-hidden="true">
+            <legend class="h2" style="margin-bottom:8px;">
+              {{ field.label }}
+              <span class="badge badge--multi">Multi-select</span>
+            </legend>
+
+            <p class="qhelp">Select all that apply.</p>
+
+            <div class="choice">
+              {% for stored, display in field.field.choices %}
+                {% with input_id=field.name|stringformat:"s"|add:"_"|add:forloop.counter0|stringformat:"s" %}
+                <label class="choice__item" data-type="checkbox" for="{{ input_id }}">
+                  <input id="{{ input_id }}" type="checkbox" name="{{ field.name }}" value="{{ stored }}"
+                         {% if field.value and stored in field.value %}checked{% endif %} />
+                  <span class="choice__tick"><span class="choice__mark"></span></span>
+                  <span class="choice__body">
+                    <span class="choice__text">{{ display }}</span>
+                  </span>
+                </label>
+                {% endwith %}
+              {% endfor %}
+            </div>
+
+            {% if field.errors %}
+              <div class="field-error">{{ field.errors }}</div>
+            {% endif %}
+          </fieldset>
+          {% endwith %}
+        {% endfor %}
+      </div>
+
+      <div class="quiz-nav" style="margin-top:14px; display:flex; gap:10px; align-items:center;">
+        <button type="button" id="btnPrev" class="btn btn--ghost" disabled>← Previous</button>
+        <button type="button" id="btnNext" class="btn">Next →</button>
+        <button type="submit" id="btnSubmit" class="btn" style="display:none;">See my matches</button>
+        <span id="quizStepBadge" class="p" style="margin-left:auto;"></span>
+      </div>
+    </form>
+  </div>
+  {% endif %}
+
+  {# -------------------- RESULTS PHASE -------------------- #}
+  {# matches is not None -> results (may be empty) #}
+  {% if matches is not None %}
+    <h2 class="h2" style="margin-top:10px;">Matching variants</h2>
+
+    {% if matches %}
+      <div class="group-grid">
+        {% for v in matches %}
+          {# Link to item detail, passing which variant was clicked #}
+          {% url 'configurator:item_detail' item_id=item.id as item_url %}
+          <a class="jelly-card"
+             href="{{ item_url }}?variant={{ v.pk }}"
+             style="--bg:{% if v.images.all|length %}url('{{ v.images.all.0.image.url }}'){% else %}linear-gradient(135deg,#0b0b0b,#222){% endif %};">
+            <div class="jelly-card__bg"></div>
+            <div class="jelly-card__img"></div>
+            <div class="jelly-card__veil"></div>
+            <div class="jelly-card__info">
+              <div class="jelly-card__name">{{ v.name }}</div>
+              {% if v.description %}
+                <div class="jelly-card__meta">{{ v.description|truncatechars_html:120|safe }}</div>
+              {% endif %}
+            </div>
+            <div class="jelly-card__footer" aria-hidden="true">
+              <svg class="jelly-curve" viewBox="0 0 400 450" preserveAspectRatio="none">
+                <path d="M0,200 Q80,100 400,200 V150 H0 V50" transform="translate(0 300)"/>
+              </svg>
+            </div>
+          </a>
+        {% endfor %}
+      </div>
+    {% else %}
+      <p class="p">No variants matched the selected spec values.</p>
+    {% endif %}
+
+    <div class="quiz-nav" style="margin-top:16px;">
+      <a class="btn btn--ghost" href=".">Start over</a>
+    </div>
+  {% endif %}
+</section>
+
+<script>
+  let panels = [];
+  let showPanel;
+
+  (function() {
+    const form = document.getElementById('quizForm');
+    if (!form) return;
+
+    panels = Array.from(document.querySelectorAll('.qpanel'));
+    const prevBtn = document.getElementById('btnPrev');
+    const nextBtn = document.getElementById('btnNext');
+    const submitBtn = document.getElementById('btnSubmit');
+    const stepBadge = document.getElementById('quizStepBadge');
+    const progressBar = document.getElementById('quizProgressBar');
+    const tagButtons = document.querySelectorAll('.tag-btn');
+
+    if (!panels.length) return;
+    let idx = 0;
+
+    function currentIsMulti() { return panels[idx].dataset.multi === '1'; }
+    function currentIsRequired() { return panels[idx].dataset.required === '1'; }
+
+    function answered(i = idx) {
+      const inputs = panels[i].querySelectorAll('input[type="checkbox"], input[type="radio"]');
+      return Array.from(inputs).some(el => el.checked);
+    }
+
+    function selectionCount(i = idx) {
+      return panels[i].querySelectorAll('input:checked').length;
+    }
+
+    function computeProgressPct() {
+      const c = panels.filter((_, i) => answered(i)).length;
+      return Math.round((c / panels.length) * 100);
+    }
+
+    function updateProgress() {
+      const pct = computeProgressPct();
+      progressBar.style.width = pct + '%';
+      document.documentElement.style.setProperty('--quiz-progress', pct + '%');
+    }
+
+    function updateNav() {
+      prevBtn.disabled = (idx === 0);
+      const onLast = (idx === panels.length - 1);
+      if (currentIsMulti()) {
+        nextBtn.style.display = onLast ? 'none' : '';
+        submitBtn.style.display = onLast ? '' : 'none';
+        const count = selectionCount();
+        nextBtn.textContent = onLast ? 'Next →' : (count > 0 ? `Next → (${count} selected)` : 'Next →');
+        stepBadge.textContent = `Step ${idx + 1} of ${panels.length} • Multi-select`;
+      } else {
+        nextBtn.style.display = 'none';
+        submitBtn.style.display = onLast ? '' : 'none';
+        stepBadge.textContent = `Step ${idx + 1} of ${panels.length} • Single choice`;
+      }
+    }
+
+    function highlightActiveTag() {
+      tagButtons.forEach((btn, i) => btn.classList.toggle('tag-btn--active', i === idx));
+    }
+
+    function focusPanel(i) {
+      const legend = panels[i].querySelector('legend');
+      if (legend) {
+        legend.setAttribute('tabindex', '-1');
+        legend.focus({ preventScroll: true });
+        setTimeout(() => legend.removeAttribute('tabindex'), 0);
+      }
+    }
+
+    showPanel = function(i) {
+      panels.forEach((p, k) => p.setAttribute('aria-hidden', k === i ? 'false' : 'true'));
+      idx = i;
+      updateNav();
+      updateProgress();
+      focusPanel(idx);
+      highlightActiveTag();
+    }
+
+    function nudgeRequired(panelIndex = idx) {
+      panels[panelIndex].style.outline = '2px solid rgba(211,51,51,.25)';
+      setTimeout(() => panels[panelIndex].style.outline = 'none', 400);
+    }
+
+    function goNext() {
+      const onLast = (idx === panels.length - 1);
+      if (onLast) return;
+      if (currentIsRequired() && !answered()) {
+        nudgeRequired(); return;
+      }
+      showPanel(idx + 1);
+    }
+
+    function goPrev() { if (idx > 0) showPanel(idx - 1); }
+
+    // click-to-select on row
+    panels.forEach((panel, k) => {
+      panel.addEventListener('click', (e) => {
+        const label = e.target.closest('label.choice__item');
+        if (!label || !panel.contains(label)) return;
+        const input = label.querySelector('input[type="checkbox"], input[type="radio"]');
+        if (!input) return;
+
+        e.preventDefault();
+        input.checked = input.type === 'radio' ? true : !input.checked;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        if (input.type === 'radio') setTimeout(() => { if (k === idx) goNext(); }, 120);
+      });
+
+      panel.addEventListener('change', () => {
+        updateProgress();
+        if (panel.dataset.multi === '1') updateNav();
+      });
+
+      panel.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && panel.dataset.multi === '1') { e.preventDefault(); goNext(); }
+        if (e.key === 'ArrowLeft') { e.preventDefault(); goPrev(); }
+        if (e.key === 'ArrowRight') { e.preventDefault(); goNext(); }
+      });
+    });
+
+    prevBtn.addEventListener('click', goPrev);
+    nextBtn.addEventListener('click', goNext);
+
+    window.jumpToPanel = function(index) {
+      if (index < 0 || index >= panels.length) return;
+      const isForward = index > idx;
+      if (isForward) {
+        const isRequired = panels[idx].dataset.required === '1';
+        const hasAnswer = Array.from(panels[idx].querySelectorAll('input[type="checkbox"], input[type="radio"]')).some(el => el.checked);
+        if (isRequired && !hasAnswer) { nudgeRequired(); return; }
+      }
+      showPanel(index);
+    };
+
+    // validate all required before submit (future-proof if some facets become required)
+    form.addEventListener('submit', (e) => {
+      const firstUnanswered = panels.findIndex((p) => p.dataset.required === '1' &&
+        !Array.from(p.querySelectorAll('input[type="checkbox"], input[type="radio"]')).some(el => el.checked));
+      if (firstUnanswered !== -1) {
+        e.preventDefault();
+        showPanel(firstUnanswered);
+        nudgeRequired(firstUnanswered);
+      }
+    });
+
+    showPanel(0);
+  })();
+</script>
+{% endblock %}
